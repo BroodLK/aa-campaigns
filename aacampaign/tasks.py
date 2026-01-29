@@ -326,16 +326,33 @@ def _pull_zkillboard_data_logic(lock_id, past_seconds=None):
         if seconds_to_pull < 172800: # 48 hours
             # Use pastSeconds API for recent pulls - it's much faster
             page = 1
+            consecutive_errors = 0
+            max_consecutive_errors = 3
             while page <= 20: # Should be plenty
                 kms = fetch_from_zkill(entity_type, entity_id, past_seconds=seconds_to_pull, page=page)
+                if kms is None:
+                    consecutive_errors += 1
+                    logger.warning(
+                        f"Failed to fetch page {page} for pastSeconds on {entity_type} {entity_id}. "
+                        f"Skipping page ({consecutive_errors}/{max_consecutive_errors})."
+                    )
+                    if consecutive_errors >= max_consecutive_errors:
+                        logger.warning(
+                            f"Too many consecutive errors for {entity_type} {entity_id}. Stopping killmail pull."
+                        )
+                        break
+                    page += 1
+                    continue
+
+                consecutive_errors = 0
                 if not kms:
                     break
 
-                logger.info(f"Fetched page {page} ({len(kms)} kills) for {entity_type} {entity_id} using pastSeconds")
+                logger.info(f"Fetched page {page} ({len(kms)} kills) for {entity_type} {entity_id}")
                 new_on_page = process_page_of_kms(kms)
                 logger.info(f"Processed {new_on_page} unique killmails from page {page}")
 
-                if len(kms) < 200: # Last page
+                if len(kms) < 1000: # Last page
                     break
 
                 # Check if last km on page is older than min_start_date
@@ -358,11 +375,26 @@ def _pull_zkillboard_data_logic(lock_id, past_seconds=None):
                 max_pages_per_month = 50
                 logger.debug(f"Pulling {entity_type} {entity_id} for {curr_year}-{curr_month:02d}")
 
+                consecutive_errors = 0
+                max_consecutive_errors = 3
                 while page <= max_pages_per_month:
                     kms = fetch_from_zkill(entity_type, entity_id, page=page, year=curr_year, month=curr_month)
                     if kms is None:
-                        logger.error(f"Failed to fetch page {page} for {curr_year}-{curr_month:02d}. Skipping month.")
-                        break
+                        consecutive_errors += 1
+                        logger.warning(
+                            f"Failed to fetch page {page} for {curr_year}-{curr_month:02d}. "
+                            f"Skipping page ({consecutive_errors}/{max_consecutive_errors})."
+                        )
+                        if consecutive_errors >= max_consecutive_errors:
+                            logger.warning(
+                                f"Too many consecutive errors for {entity_type} {entity_id} "
+                                f"({curr_year}-{curr_month:02d}). Skipping month."
+                            )
+                            break
+                        page += 1
+                        continue
+
+                    consecutive_errors = 0
 
                     if not kms:
                         logger.debug(f"No more killmails for {curr_year}-{curr_month:02d} at page {page}")
@@ -509,24 +541,36 @@ def fetch_from_zkill(entity_type, entity_id, past_seconds=None, page=None, year=
     else:
         url += "page/1/"
 
-    try:
-        response = _zkill_get(url)
-        data = response.json()
-        if not isinstance(data, list):
-            logger.error(
-                f"Unexpected response from zKillboard for {entity_type} {entity_id}: "
-                f"expected list, got {type(data)}. Content: {data}"
-            )
+    for attempt in range(1, 4):
+        try:
+            response = _zkill_get(url)
+            if response.status_code != 200:
+                raise ValueError(f"Status {response.status_code}")
+            data = response.json()
+            if not isinstance(data, list):
+                logger.error(
+                    f"Unexpected response from zKillboard for {entity_type} {entity_id}: "
+                    f"expected list, got {type(data)}. Content: {data}"
+                )
+                return None
+            if not data:
+                logger.debug(f"No results from zKillboard for {entity_type} {entity_id}")
+                return []
+            filtered = [km for km in data if isinstance(km, dict)]
+            if not filtered:
+                logger.debug(f"All results were non-dict from zKillboard for {entity_type} {entity_id}")
+                return None
+            logger.debug(f"Fetched {len(filtered)} results from zKillboard for {entity_type} {entity_id}")
+            return filtered
+        except Exception as e:
+            if attempt < 3:
+                logger.warning(
+                    f"Error fetching from zkillboard for {entity_type} {entity_id} (attempt {attempt}/3): {e}"
+                )
+                time.sleep(2 * attempt)
+                continue
+            logger.error(f"Error fetching from zkillboard for {entity_type} {entity_id}: {e}")
             return None
-        data = [km for km in data if isinstance(km, dict)]
-        if not data:
-            logger.debug(f"All results were null from zKillboard for {entity_type} {entity_id}")
-            return None
-        logger.debug(f"Fetched {len(data)} results from zKillboard for {entity_type} {entity_id}")
-        return data
-    except Exception as e:
-        logger.error(f"Error fetching from zkillboard for {entity_type} {entity_id}: {e}")
-        return None
 
 def fetch_killmail_from_esi(killmail_id, killmail_hash):
     try:
