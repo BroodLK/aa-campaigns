@@ -584,11 +584,15 @@ def should_include_killmail(campaign, km_data, campaign_meta=None, context=None)
     # We need: time, system, victim (for ship info), and attackers (for involvement and final blow)
     attacker_count = km_data.get('zkb', {}).get('attackerCount', 0)
     has_all_attackers = 'attackers' in km_data and len(km_data['attackers']) >= attacker_count
-    has_final_blow = 'attackers' in km_data and any('final_blow' in a for a in km_data['attackers'])
+    has_final_blow = 'attackers' in km_data and any(a.get('final_blow') for a in km_data['attackers'])
+    has_final_blow_char = (
+        'attackers' in km_data and
+        any(a.get('final_blow') and a.get('character_id') for a in km_data['attackers'])
+    )
 
     needs_esi = (
         any(k not in km_data for k in ['killmail_time', 'solar_system_id', 'victim', 'attackers']) or
-        not has_final_blow or
+        not has_final_blow_char or
         not has_all_attackers
     )
 
@@ -606,23 +610,38 @@ def should_include_killmail(campaign, km_data, campaign_meta=None, context=None)
                     km_data['solar_system_id'] = db_system_id
                     # Re-check if we still need ESI
                     has_all_attackers = 'attackers' in km_data and len(km_data['attackers']) >= attacker_count
-                    has_final_blow = 'attackers' in km_data and any('final_blow' in a for a in km_data['attackers'])
+                    has_final_blow = 'attackers' in km_data and any(a.get('final_blow') for a in km_data['attackers'])
+                    has_final_blow_char = (
+                        'attackers' in km_data and
+                        any(a.get('final_blow') and a.get('character_id') for a in km_data['attackers'])
+                    )
                     needs_esi = (
                         any(k not in km_data for k in ['killmail_time', 'solar_system_id', 'victim', 'attackers']) or
-                        not has_final_blow or
+                        not has_final_blow_char or
                         not has_all_attackers
                     )
 
         if needs_esi:
             if km_hash:
                 reason = "missing fields"
-                if not has_final_blow: reason = "missing final blow"
-                if not has_all_attackers: reason = f"incomplete attackers ({len(km_data.get('attackers', []))}/{attacker_count})"
+                if not has_final_blow_char:
+                    reason = "missing final blow character"
+                elif not has_final_blow:
+                    reason = "missing final blow"
+                if not has_all_attackers:
+                    reason = f"incomplete attackers ({len(km_data.get('attackers', []))}/{attacker_count})"
                 logger.info(f"Killmail {km_id} needs ESI fetch ({reason}), attempting to fetch")
                 esi_data = fetch_killmail_from_esi(km_id_val, km_hash)
                 if esi_data:
                     logger.debug(f"Successfully fetched killmail {km_id} from ESI")
                     km_data.update(esi_data)
+                    has_final_blow_char = (
+                        'attackers' in km_data and
+                        any(a.get('final_blow') and a.get('character_id') for a in km_data['attackers'])
+                    )
+                    if not has_final_blow_char:
+                        logger.warning(f"Killmail {km_id} missing final blow character after ESI fetch")
+                        return False
                 else:
                     logger.warning(f"Killmail {km_id} missing required fields and ESI fetch failed (ID: {km_id_val}, Hash: {km_hash})")
                     return False
@@ -826,7 +845,7 @@ def process_killmail(campaign, km_data, campaign_meta=None, context=None):
     victim_corp_id = victim.get('corporation_id') or 0
     victim_alliance_id = victim.get('alliance_id')
 
-    ship_type_id = victim.get('ship_type_id', 0)
+    ship_type_id = victim.get('ship_type_id') or 0
     ship_type_name = "Unknown"
     ship_group_name = "Unknown"
     if ship_type_id:
@@ -869,8 +888,8 @@ def process_killmail(campaign, km_data, campaign_meta=None, context=None):
     if not final_blow_attacker:
         logger.warning(f"Killmail {km_id} has no attacker marked as final blow. Attackers count: {len(km_data.get('attackers', []))}")
 
-    fb_char_id = final_blow_attacker.get('character_id', 0)
-    fb_corp_id = final_blow_attacker.get('corporation_id', 0)
+    fb_char_id = final_blow_attacker.get('character_id') or 0
+    fb_corp_id = final_blow_attacker.get('corporation_id') or 0
     fb_alliance_id = final_blow_attacker.get('alliance_id')
 
     fb_char_name = (
