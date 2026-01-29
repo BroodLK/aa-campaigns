@@ -518,6 +518,10 @@ def fetch_from_zkill(entity_type, entity_id, past_seconds=None, page=None, year=
                 f"expected list, got {type(data)}. Content: {data}"
             )
             return None
+        data = [km for km in data if isinstance(km, dict)]
+        if not data:
+            logger.debug(f"All results were null from zKillboard for {entity_type} {entity_id}")
+            return None
         logger.debug(f"Fetched {len(data)} results from zKillboard for {entity_type} {entity_id}")
         return data
     except Exception as e:

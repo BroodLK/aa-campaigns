@@ -10,7 +10,7 @@
 > AA Campaign requires a working installation of **Alliance Auth** and **django-eveuniverse**. Ensure these are set up before proceeding with the installation.
 
 # AA Campaign
-AA Campaign is a plugin for **Alliance Auth** that allows you to create and track Z-Kill campaigns. Whether you're monitoring a specific system, a whole region, or targeting a rival alliance, AA Campaign pulls data directly from ZKillboard to provide real-time intelligence and performance tracking.
+AA Campaign is a plugin for **Alliance Auth** that allows you to create and track ZKill campaigns. Whether you're monitoring a specific system, a whole region, or targeting a rival alliance, AA Campaign pulls data directly from ZKillboard to provide real-time intelligence and performance tracking.
 
 ## Screenshots
 <img src="https://i.imgur.com/UZWiWMh.png" alt="AA Campaign dashboard overview" width="900" style="max-width: 100%; height: auto;">
@@ -42,7 +42,7 @@ After making sure to add the above prerequisite applications.
 source /home/allianceserver/venv/auth/bin/activate && cd /home/allianceserver/myauth/
 ```
 ```bash
-pip install aa-campaign==1.0.0
+pip install aa-campaign==1.0.1
 ```
 ```bash
 vi myauth/settings/local.py
@@ -68,7 +68,7 @@ sudo supervisorctl restart myauth:
 >
 > You can repair killmails using:
 > ```bash
-> python manage.py aa_campaign_repair
+> python manage.py aa_campaign_pull --repair
 > ```
 
 > [!WARNING]

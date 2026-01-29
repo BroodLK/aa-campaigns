@@ -105,7 +105,9 @@ class Command(BaseCommand):
         if days:
             seconds = days * 86400
 
-        if seconds:
+        if days:
+            self.stdout.write(f"Triggering ZKillboard data pull for the last {days} days...")
+        elif seconds:
             self.stdout.write(f"Triggering ZKillboard data pull for the last {seconds} seconds...")
         else:
             self.stdout.write("Triggering ZKillboard data pull (defaulting to today's data)...")
