@@ -5,8 +5,20 @@ Create your models in here
 
 # Django
 from django.db import models
-from allianceauth.eveonline.models import EveAllianceInfo, EveCorporationInfo, EveCharacter
-from eveuniverse.models import EveSolarSystem, EveRegion, EveConstellation
+from allianceauth.eveonline.models import (
+    EveAllianceInfo,
+    EveCorporationInfo,
+    EveCharacter,
+    EveFactionInfo,
+)
+
+# AA Campaign
+from .eve_sde import (
+    CONSTELLATION_MODEL,
+    REGION_MODEL,
+    SOLAR_SYSTEM_MODEL,
+    get_system_region,
+)
 
 class Campaign(models.Model):
     """A Z-Kill campaign"""
@@ -17,9 +29,15 @@ class Campaign(models.Model):
     is_active = models.BooleanField(default=True)
     last_run = models.DateTimeField(null=True, blank=True, default=None)
 
-    systems = models.ManyToManyField(EveSolarSystem, blank=True, related_name='campaigns')
-    regions = models.ManyToManyField(EveRegion, blank=True, related_name='campaigns')
-    constellations = models.ManyToManyField(EveConstellation, blank=True, related_name='campaigns')
+    systems = models.ManyToManyField(
+        SOLAR_SYSTEM_MODEL, blank=True, related_name="campaigns"
+    )
+    regions = models.ManyToManyField(
+        REGION_MODEL, blank=True, related_name="campaigns"
+    )
+    constellations = models.ManyToManyField(
+        CONSTELLATION_MODEL, blank=True, related_name="campaigns"
+    )
 
     class Meta:
         default_permissions = ()
@@ -37,9 +55,10 @@ class CampaignMember(models.Model):
     character = models.ForeignKey(EveCharacter, on_delete=models.CASCADE, null=True, blank=True)
     corporation = models.ForeignKey(EveCorporationInfo, on_delete=models.CASCADE, null=True, blank=True)
     alliance = models.ForeignKey(EveAllianceInfo, on_delete=models.CASCADE, null=True, blank=True)
+    faction = models.ForeignKey(EveFactionInfo, on_delete=models.CASCADE, null=True, blank=True)
 
     def __str__(self):
-        return str(self.character or self.corporation or self.alliance)
+        return str(self.character or self.corporation or self.alliance or self.faction)
 
 class CampaignTarget(models.Model):
     """A specific hostile entity in a campaign"""
@@ -47,16 +66,19 @@ class CampaignTarget(models.Model):
     character = models.ForeignKey(EveCharacter, on_delete=models.CASCADE, null=True, blank=True)
     corporation = models.ForeignKey(EveCorporationInfo, on_delete=models.CASCADE, null=True, blank=True)
     alliance = models.ForeignKey(EveAllianceInfo, on_delete=models.CASCADE, null=True, blank=True)
+    faction = models.ForeignKey(EveFactionInfo, on_delete=models.CASCADE, null=True, blank=True)
 
     def __str__(self):
-        return str(self.character or self.corporation or self.alliance)
+        return str(self.character or self.corporation or self.alliance or self.faction)
 
 class CampaignKillmail(models.Model):
     """A killmail associated with a campaign"""
     campaign = models.ForeignKey(Campaign, on_delete=models.CASCADE, related_name='killmails')
     killmail_id = models.BigIntegerField()
     killmail_time = models.DateTimeField()
-    solar_system = models.ForeignKey(EveSolarSystem, on_delete=models.SET_NULL, null=True)
+    solar_system = models.ForeignKey(
+        SOLAR_SYSTEM_MODEL, on_delete=models.SET_NULL, null=True
+    )
 
     ship_type_id = models.IntegerField(default=0)
     ship_type_name = models.CharField(max_length=255, default="")
@@ -88,3 +110,12 @@ class CampaignKillmail(models.Model):
 
     def __str__(self):
         return f"{self.campaign.name} - {self.killmail_id}"
+
+    @property
+    def solar_system_region(self):
+        return get_system_region(self.solar_system)
+
+    @property
+    def solar_system_region_name(self):
+        region = self.solar_system_region
+        return getattr(region, "name", "") if region else ""

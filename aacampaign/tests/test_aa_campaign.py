@@ -6,10 +6,55 @@ AA Campaign Test
 from django.test import TestCase
 from django.utils import timezone
 from aacampaign.models import Campaign, CampaignMember, CampaignKillmail, CampaignTarget
-from allianceauth.eveonline.models import EveCharacter, EveCorporationInfo, EveAllianceInfo
-from eveuniverse.models import EveSolarSystem, EveConstellation, EveRegion
-from aacampaign.tasks import should_include_killmail, process_killmail, fetch_from_zkill, pull_zkillboard_data
+from allianceauth.eveonline.models import (
+    EveCharacter,
+    EveCorporationInfo,
+    EveAllianceInfo,
+    EveFactionInfo,
+)
+from aacampaign.eve_sde import (
+    get_constellation_model,
+    get_region_model,
+    get_related_field_name,
+    get_solar_system_model,
+)
+from aacampaign.tasks import (
+    should_include_killmail,
+    process_killmail,
+    fetch_from_zkill,
+    pull_zkillboard_data,
+    cleanup_campaign_killmails
+)
 from unittest.mock import patch, MagicMock
+
+EveRegion = get_region_model()
+EveConstellation = get_constellation_model()
+EveSolarSystem = get_solar_system_model()
+
+_CONSTELLATION_REGION_FIELD = get_related_field_name(
+    EveConstellation, ("region", "eve_region")
+)
+_SYSTEM_CONSTELLATION_FIELD = get_related_field_name(
+    EveSolarSystem, ("constellation", "eve_constellation")
+)
+
+
+def _create_region(**kwargs):
+    return EveRegion.objects.create(**kwargs)
+
+
+def _create_constellation(region, **kwargs):
+    if not _CONSTELLATION_REGION_FIELD:
+        raise AssertionError("Constellation model missing region relation for tests.")
+    kwargs[_CONSTELLATION_REGION_FIELD] = region
+    return EveConstellation.objects.create(**kwargs)
+
+
+def _create_system(constellation, **kwargs):
+    if not _SYSTEM_CONSTELLATION_FIELD:
+        raise AssertionError("Solar system model missing constellation relation for tests.")
+    kwargs[_SYSTEM_CONSTELLATION_FIELD] = constellation
+    return EveSolarSystem.objects.create(**kwargs)
 
 class TestZKillboardAPI(TestCase):
     @patch('aacampaign.tasks._zkill_session.get')
@@ -162,7 +207,7 @@ class TestZKillboardAPI(TestCase):
         CampaignTarget.objects.create(campaign=campaign, alliance=alliance_target)
 
         # Location (should be pulled)
-        region = EveRegion.objects.create(id=10, name="Target Region")
+        region = _create_region(id=10, name="Target Region")
         campaign.regions.add(region)
 
         mock_fetch.return_value = []
@@ -255,9 +300,14 @@ class TestZKillboardAPI(TestCase):
 class TestCampaign(TestCase):
     def setUp(self):
         # Setup basic universe
-        self.region = EveRegion.objects.create(id=10000001, name="Test Region")
-        self.constellation = EveConstellation.objects.create(id=20000001, name="Test Const", eve_region=self.region)
-        self.system = EveSolarSystem.objects.create(id=30000001, name="Test System", eve_constellation=self.constellation, security_status=0.5)
+        self.region = _create_region(id=10000001, name="Test Region")
+        self.constellation = _create_constellation(id=20000001, name="Test Const", region=self.region)
+        self.system = _create_system(
+            id=30000001,
+            name="Test System",
+            constellation=self.constellation,
+            security_status=0.5,
+        )
 
         # Setup characters
         self.char1 = EveCharacter.objects.create(character_id=1, character_name="Friendly Char", corporation_id=10, corporation_name="Friendly Corp")
@@ -281,6 +331,19 @@ class TestCampaign(TestCase):
         }
         self.assertTrue(should_include_killmail(self.campaign, km_data))
 
+    def test_should_include_killmail_friendly_faction_attacker(self):
+        faction = EveFactionInfo.objects.create(faction_id=500001, faction_name="Amarr Empire")
+        CampaignMember.objects.create(campaign=self.campaign, faction=faction)
+
+        km_data = {
+            'killmail_id': 12348,
+            'killmail_time': timezone.now().isoformat(),
+            'solar_system_id': 30000001,
+            'attackers': [{'character_id': 999, 'faction_id': 500001, 'final_blow': True}],
+            'victim': {'character_id': 2}
+        }
+        self.assertTrue(should_include_killmail(self.campaign, km_data))
+
     def test_should_include_killmail_wrong_location(self):
         km_data = {
             'killmail_id': 12345,
@@ -295,7 +358,7 @@ class TestCampaign(TestCase):
         char_target = EveCharacter.objects.create(character_id=3, character_name="Target", corporation_id=30, corporation_name="TCorp")
         CampaignTarget.objects.create(campaign=self.campaign, character=char_target)
 
-        # Kill outside region, but it's a target
+        # Kill outside region even if it's a target
         km_data = {
             'killmail_id': 12346,
             'killmail_time': timezone.now().isoformat(),
@@ -303,18 +366,32 @@ class TestCampaign(TestCase):
             'attackers': [{'character_id': 1, 'final_blow': True}],
             'victim': {'character_id': 3}
         }
+        self.assertFalse(should_include_killmail(self.campaign, km_data))
+
+    def test_should_include_killmail_regional_with_target_inside(self):
+        char_target = EveCharacter.objects.create(character_id=4, character_name="Target 2", corporation_id=40, corporation_name="TCorp 2")
+        CampaignTarget.objects.create(campaign=self.campaign, character=char_target)
+
+        # Kill inside region and against a target
+        km_data = {
+            'killmail_id': 12347,
+            'killmail_time': timezone.now().isoformat(),
+            'solar_system_id': 30000001,
+            'attackers': [{'character_id': 1, 'final_blow': True}],
+            'victim': {'character_id': 4}
+        }
         self.assertTrue(should_include_killmail(self.campaign, km_data))
 
-    @patch('aacampaign.tasks.EveType.objects.get_or_create_esi')
+    @patch('aacampaign.tasks._get_item_type')
     @patch('aacampaign.tasks.EveCharacter.objects.create_character')
-    @patch('aacampaign.tasks.call_result')
-    def test_process_killmail(self, mock_call_result, mock_create_char, mock_get_type):
-        mock_call_result.return_value = ([{'name': 'Resolved Name'}], None)
+    @patch('aacampaign.tasks.ESIHandler.post_universe_names')
+    def test_process_killmail(self, mock_post_names, mock_create_char, mock_get_type):
+        mock_post_names.return_value = [{'name': 'Resolved Name'}]
         mock_create_char.return_value = self.char1
 
         mock_type = MagicMock()
         mock_type.eve_group.name = 'Test Group'
-        mock_get_type.return_value = (mock_type, True)
+        mock_get_type.return_value = mock_type
 
         km_data = {
             'killmail_id': 12345,
@@ -337,15 +414,15 @@ class TestCampaign(TestCase):
         self.assertEqual(ckm.victim_name, 'Resolved Name')
         self.assertEqual(ckm.ship_group_name, 'Test Group')
 
-    @patch('aacampaign.tasks.EveType.objects.get_or_create_esi')
+    @patch('aacampaign.tasks._get_item_type')
     @patch('aacampaign.tasks.EveCharacter.objects.create_character')
-    @patch('aacampaign.tasks.call_result')
-    def test_process_killmail_corp_member(self, mock_call_result, mock_create_char, mock_get_type):
-        mock_call_result.return_value = ([{'name': 'Resolved Name'}], None)
+    @patch('aacampaign.tasks.ESIHandler.post_universe_names')
+    def test_process_killmail_corp_member(self, mock_post_names, mock_create_char, mock_get_type):
+        mock_post_names.return_value = [{'name': 'Resolved Name'}]
 
         mock_type = MagicMock()
         mock_type.eve_group.name = 'Test Group'
-        mock_get_type.return_value = (mock_type, True)
+        mock_get_type.return_value = mock_type
 
         corp = EveCorporationInfo.objects.create(corporation_id=100, corporation_name="Member Corp", member_count=1)
         CampaignMember.objects.create(campaign=self.campaign, corporation=corp)
@@ -405,9 +482,14 @@ class TestGlobalCampaign(TestCase):
     def test_should_include_killmail_uses_db_cache(self):
         # Create an existing killmail in DB
         # Basic setup
-        region = EveRegion.objects.create(id=10000002, name="Test Region 2")
-        constellation = EveConstellation.objects.create(id=20000002, name="Test Const 2", eve_region=region)
-        system = EveSolarSystem.objects.create(id=30000002, name="Test System 2", eve_constellation=constellation, security_status=0.5)
+        region = _create_region(id=10000002, name="Test Region 2")
+        constellation = _create_constellation(id=20000002, name="Test Const 2", region=region)
+        system = _create_system(
+            id=30000002,
+            name="Test System 2",
+            constellation=constellation,
+            security_status=0.5,
+        )
         char1 = EveCharacter.objects.get(character_id=1)
 
         campaign = Campaign.objects.create(
@@ -438,14 +520,14 @@ class TestGlobalCampaign(TestCase):
         }
 
         # This should NOT call ESI and should return True because it's in the DB
-        with patch('aacampaign.tasks.call_result') as mock_call:
+        with patch('aacampaign.tasks.ESIHandler.get_killmail') as mock_call:
             self.assertTrue(should_include_killmail(campaign, km_data))
             mock_call.assert_not_called()
             self.assertIn('killmail_time', km_data)
             self.assertEqual(km_data['solar_system_id'], system.id)
 
-    @patch('aacampaign.tasks.call_result')
-    def test_should_include_killmail_triggers_esi(self, mock_call_result):
+    @patch('aacampaign.tasks.ESIHandler.get_killmail')
+    def test_should_include_killmail_triggers_esi(self, mock_get_killmail):
         # Killmail missing fields, not in DB
         km_data = {
             'killmail_id': 1234567,
@@ -471,12 +553,17 @@ class TestGlobalCampaign(TestCase):
                 }
             ]
         }
-        mock_call_result.return_value = (mock_esi_data, None)
+        mock_get_killmail.return_value = mock_esi_data
 
         # Basic setup
-        region = EveRegion.objects.create(id=10000003, name="ESI Region")
-        constellation = EveConstellation.objects.create(id=20000003, name="ESI Const", eve_region=region)
-        system = EveSolarSystem.objects.create(id=30000001, name="ESI System", eve_constellation=constellation, security_status=0.5)
+        region = _create_region(id=10000003, name="ESI Region")
+        constellation = _create_constellation(id=20000003, name="ESI Const", region=region)
+        system = _create_system(
+            id=30000001,
+            name="ESI System",
+            constellation=constellation,
+            security_status=0.5,
+        )
         char1 = EveCharacter.objects.create(character_id=111, character_name="ESI Friendly", corporation_id=10)
 
         campaign = Campaign.objects.create(
@@ -489,14 +576,11 @@ class TestGlobalCampaign(TestCase):
         # This should call ESI and succeed
         self.assertTrue(should_include_killmail(campaign, km_data))
 
-        # Verify call_result was called with the correct operation (plural Killmails)
-        self.assertEqual(mock_call_result.call_count, 1)
-        args, _ = mock_call_result.call_args
-        # The first arg is the operation. We can't easily check its name if it's a mock or a dynamic object,
-        # but if we didn't get an AttributeError, it means the path esi.client.Killmails... was valid.
+        # Verify ESI handler was called
+        self.assertEqual(mock_get_killmail.call_count, 1)
 
-    @patch('aacampaign.tasks.call_result')
-    def test_should_include_killmail_truncated_attackers(self, mock_call_result):
+    @patch('aacampaign.tasks.ESIHandler.get_killmail')
+    def test_should_include_killmail_truncated_attackers(self, mock_get_killmail):
         # Setup: Campaign for Alliance 99009902
         campaign = Campaign.objects.create(
             name="Truncated Test Campaign",
@@ -533,13 +617,122 @@ class TestGlobalCampaign(TestCase):
             {'character_id': 113},
             {'character_id': 114},
         ]
-        mock_call_result.return_value = (mock_esi_data, None)
+        mock_get_killmail.return_value = mock_esi_data
 
         # Initially, km_data has no friendly in attackers.
         # But it HAS final_blow=True guy, so old logic would have skipped ESI!
 
         # This should call ESI because len(attackers) < attackerCount
         self.assertTrue(should_include_killmail(campaign, km_data))
-        self.assertEqual(mock_call_result.call_count, 1)
+        self.assertEqual(mock_get_killmail.call_count, 1)
         self.assertIn('attackers', km_data)
         self.assertEqual(len(km_data['attackers']), 5)
+
+class TestCleanupCampaignKillmails(TestCase):
+    def setUp(self):
+        self.region = _create_region(id=10000010, name="Cleanup Region")
+        self.constellation = _create_constellation(
+            id=20000010,
+            name="Cleanup Const",
+            region=self.region,
+        )
+        self.system = _create_system(
+            id=30000010,
+            name="Cleanup System",
+            constellation=self.constellation,
+            security_status=0.5,
+        )
+
+        self.friendly = EveCharacter.objects.create(
+            character_id=10,
+            character_name="Cleanup Friendly",
+            corporation_id=100,
+            corporation_name="Cleanup Corp"
+        )
+        self.target = EveCharacter.objects.create(
+            character_id=11,
+            character_name="Cleanup Target",
+            corporation_id=110,
+            corporation_name="Target Corp"
+        )
+
+        self.campaign = Campaign.objects.create(
+            name="Cleanup Campaign",
+            start_date=timezone.now() - timezone.timedelta(days=1),
+            is_active=True
+        )
+        self.campaign.systems.add(self.system)
+        CampaignMember.objects.create(campaign=self.campaign, character=self.friendly)
+        CampaignTarget.objects.create(campaign=self.campaign, character=self.target)
+
+    @patch('aacampaign.tasks.cache')
+    @patch('aacampaign.tasks._zkill_get')
+    def test_cleanup_campaign_killmails_removes_mismatch(self, mock_zkill, mock_cache):
+        mock_cache.add.return_value = True
+
+        km_id = 444444
+        CampaignKillmail.objects.create(
+            campaign=self.campaign,
+            killmail_id=km_id,
+            killmail_time=timezone.now(),
+            solar_system=self.system,
+            victim_id=2,
+            victim_name="Victim",
+            victim_corp_id=20,
+            victim_corp_name="VCorp",
+            total_value=0
+        )
+
+        km_data = {
+            'killmail_id': km_id,
+            'killmail_time': timezone.now().isoformat(),
+            'solar_system_id': self.system.id,
+            'attackers': [{'character_id': self.friendly.character_id, 'final_blow': True}],
+            'victim': {'character_id': 999}
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = [km_data]
+        mock_zkill.return_value = mock_response
+
+        cleanup_campaign_killmails()
+
+        self.assertFalse(
+            CampaignKillmail.objects.filter(
+                campaign=self.campaign,
+                killmail_id=km_id
+            ).exists()
+        )
+
+    @patch('aacampaign.tasks.cache')
+    @patch('aacampaign.tasks._zkill_get')
+    def test_cleanup_campaign_killmails_skips_incomplete(self, mock_zkill, mock_cache):
+        mock_cache.add.return_value = True
+
+        km_id = 555555
+        CampaignKillmail.objects.create(
+            campaign=self.campaign,
+            killmail_id=km_id,
+            killmail_time=timezone.now(),
+            solar_system=self.system,
+            victim_id=2,
+            victim_name="Victim",
+            victim_corp_id=20,
+            victim_corp_name="VCorp",
+            total_value=0
+        )
+
+        km_data = {
+            'killmail_id': km_id
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = [km_data]
+        mock_zkill.return_value = mock_response
+
+        cleanup_campaign_killmails()
+
+        self.assertTrue(
+            CampaignKillmail.objects.filter(
+                campaign=self.campaign,
+                killmail_id=km_id
+            ).exists()
+        )

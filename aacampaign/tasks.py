@@ -6,18 +6,141 @@ import requests
 import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from django.utils import timezone
+
+# Django
 from django.conf import settings
 from django.core.cache import cache
-from celery import shared_task
-from .models import Campaign, CampaignKillmail, CampaignMember, CampaignTarget
-from .esi import esi, call_result
-from allianceauth.eveonline.models import EveCharacter, EveCorporationInfo, EveAllianceInfo
-from eveuniverse.models import EveSolarSystem, EveEntity, EveType, EveConstellation, EveRegion
+from django.core.exceptions import AppRegistryNotReady, ImproperlyConfigured
 from django.db import transaction
 from django.db.models import Q
+from django.utils import timezone
+
+# Third Party
+from celery import shared_task
+
+# Alliance Auth
+from allianceauth.eveonline.models import EveCharacter, EveCorporationInfo, EveAllianceInfo
+
+# AA Campaign
+from .models import Campaign, CampaignKillmail, CampaignMember, CampaignTarget
+from .esi import ESIHandler
+from .eve_sde import (
+    get_constellation_model,
+    get_item_type_model,
+    get_region_model,
+    get_related_field_name,
+    get_solar_system_model,
+)
 
 logger = logging.getLogger(__name__)
+
+EveSolarSystem = None
+EveConstellation = None
+EveRegion = None
+EveType = None
+_SYSTEM_CONSTELLATION_FIELD = None
+_CONSTELLATION_REGION_FIELD = None
+_TYPE_GROUP_FIELD = None
+
+
+def _ensure_eve_models():
+    global EveSolarSystem, EveConstellation, EveRegion, EveType
+    if EveSolarSystem is None:
+        EveSolarSystem = get_solar_system_model()
+        EveConstellation = get_constellation_model()
+        EveRegion = get_region_model()
+        EveType = get_item_type_model()
+    return EveSolarSystem, EveConstellation, EveRegion, EveType
+
+
+def _ensure_eve_fields():
+    global _SYSTEM_CONSTELLATION_FIELD, _CONSTELLATION_REGION_FIELD, _TYPE_GROUP_FIELD
+    _ensure_eve_models()
+    if _SYSTEM_CONSTELLATION_FIELD is None:
+        _SYSTEM_CONSTELLATION_FIELD = get_related_field_name(
+            EveSolarSystem, ("constellation", "eve_constellation")
+        )
+        if not _SYSTEM_CONSTELLATION_FIELD:
+            raise ImproperlyConfigured(
+                "Solar system model is missing a constellation relation. "
+                "Expected one of: constellation, eve_constellation."
+            )
+    if _CONSTELLATION_REGION_FIELD is None:
+        _CONSTELLATION_REGION_FIELD = get_related_field_name(
+            EveConstellation, ("region", "eve_region")
+        )
+        if not _CONSTELLATION_REGION_FIELD:
+            raise ImproperlyConfigured(
+                "Constellation model is missing a region relation. "
+                "Expected one of: region, eve_region."
+            )
+    if _TYPE_GROUP_FIELD is None:
+        _TYPE_GROUP_FIELD = get_related_field_name(
+            EveType, ("group", "item_group", "eve_group")
+        )
+    return _SYSTEM_CONSTELLATION_FIELD, _CONSTELLATION_REGION_FIELD, _TYPE_GROUP_FIELD
+
+
+def _system_select_related_fields():
+    constellation_field, region_field, _ = _ensure_eve_fields()
+    fields = [constellation_field]
+    if region_field:
+        fields.append(f"{constellation_field}__{region_field}")
+    return fields
+
+
+def _get_system_constellation_id(system):
+    constellation_field, _, _ = _ensure_eve_fields()
+    return getattr(system, f"{constellation_field}_id", None)
+
+
+def _get_system_region_id(system):
+    constellation_field, region_field, _ = _ensure_eve_fields()
+    constellation = getattr(system, constellation_field, None)
+    if not constellation:
+        return None
+    return getattr(constellation, f"{region_field}_id", None)
+
+
+def _get_item_type(ship_type_id, context=None):
+    if not ship_type_id:
+        return None
+
+    _ensure_eve_models()
+    _, _, _, group_field = _ensure_eve_fields()
+    if context and ship_type_id in context.get("resolved_types", {}):
+        return context["resolved_types"][ship_type_id]
+
+    qs = EveType.objects.filter(id=ship_type_id)
+    if group_field:
+        qs = qs.select_related(group_field)
+    s_type = qs.first()
+
+    if s_type is None and hasattr(EveType.objects, "get_or_create_esi"):
+        try:
+            s_type, _ = EveType.objects.get_or_create_esi(id=ship_type_id)
+        except Exception:
+            s_type = None
+
+    if context is not None:
+        context.setdefault("resolved_types", {})[ship_type_id] = s_type
+    return s_type
+
+
+def _get_type_group_name(s_type):
+    if not s_type:
+        return "Unknown"
+    for attr in ("eve_group", "group", "item_group"):
+        group = getattr(s_type, attr, None)
+        if group and getattr(group, "name", None):
+            return group.name
+    return "Unknown"
+
+
+try:
+    _ensure_eve_models()
+except AppRegistryNotReady:
+    pass
 
 # Reusable session for zKillboard calls
 _zkill_session = requests.Session()
@@ -57,10 +180,7 @@ def _zkill_get(url):
 
 def _fetch_universe_names(ids):
     try:
-        data, _ = call_result(
-            lambda: esi.client.Universe.PostUniverseNames,
-            body=ids
-        )
+        data = ESIHandler.post_universe_names(ids, use_etag=False)
         return data
     except Exception:
         return None
@@ -95,6 +215,7 @@ def pull_zkillboard_data(past_seconds=None):
         cache.delete(lock_id)
 
 def _pull_zkillboard_data_logic(lock_id, past_seconds=None):
+    _ensure_eve_models()
     logger.info("ZKillboard data pull task started")
     start_time = time.time()
     now = timezone.now()
@@ -156,6 +277,7 @@ def _pull_zkillboard_data_logic(lock_id, past_seconds=None):
             target_ids['characters'] or
             target_ids['corporations'] or
             target_ids['alliances'] or
+            target_ids['factions'] or
             campaign_meta[campaign.id]['system_ids'] or
             campaign_meta[campaign.id]['constellation_ids'] or
             campaign_meta[campaign.id]['region_ids']
@@ -173,12 +295,15 @@ def _pull_zkillboard_data_logic(lock_id, past_seconds=None):
                 add_raw_entity('corporationID', corp_id)
             for alliance_id in friendly_ids['alliances']:
                 add_raw_entity('allianceID', alliance_id)
+            for faction_id in friendly_ids['factions']:
+                add_raw_entity('factionID', faction_id)
         elif has_filters:
             # No friendlies configured; fall back to targets and locations.
             for target in campaign.targets.all():
                 if target.character: add_raw_entity('characterID', target.character.character_id)
                 if target.corporation: add_raw_entity('corporationID', target.corporation.corporation_id)
                 if target.alliance: add_raw_entity('allianceID', target.alliance.alliance_id)
+                if target.faction: add_raw_entity('factionID', target.faction.faction_id)
 
             for system in campaign.systems.all(): add_raw_entity('systemID', system.id)
             for constellation in campaign.constellations.all(): add_raw_entity('constellationID', constellation.id)
@@ -228,8 +353,14 @@ def _pull_zkillboard_data_logic(lock_id, past_seconds=None):
 
     # 3. De-duplicate systems (Skip if constellation or region is being pulled with sufficient range)
     system_ids = list(by_type.get('systemID', {}).keys())
-    system_info = {s.id: (s.eve_constellation_id, s.eve_constellation.eve_region_id)
-                   for s in EveSolarSystem.objects.filter(id__in=system_ids).select_related('eve_constellation')}
+    system_qs = EveSolarSystem.objects.filter(id__in=system_ids)
+    select_related_fields = _system_select_related_fields()
+    if select_related_fields:
+        system_qs = system_qs.select_related(*select_related_fields)
+    system_info = {
+        s.id: (_get_system_constellation_id(s), _get_system_region_id(s))
+        for s in system_qs
+    }
     for eid, start_date in by_type.get('systemID', {}).items():
         const_id, region_id = system_info.get(eid, (None, None))
         parent_being_pulled = False
@@ -245,7 +376,11 @@ def _pull_zkillboard_data_logic(lock_id, past_seconds=None):
 
     # 4. De-duplicate constellations (Skip if region is being pulled with sufficient range)
     const_ids = list(by_type.get('constellationID', {}).keys())
-    const_info = {c.id: c.eve_region_id for c in EveConstellation.objects.filter(id__in=const_ids)}
+    _, region_field, _ = _ensure_eve_fields()
+    const_info = {
+        c.id: getattr(c, f"{region_field}_id", None)
+        for c in EveConstellation.objects.filter(id__in=const_ids)
+    }
     for eid, start_date in by_type.get('constellationID', {}).items():
         region_id = const_info.get(eid)
         parent_being_pulled = False
@@ -261,6 +396,8 @@ def _pull_zkillboard_data_logic(lock_id, past_seconds=None):
         entities[('allianceID', eid)] = start_date
     for eid, start_date in by_type.get('regionID', {}).items():
         entities[('regionID', eid)] = start_date
+    for eid, start_date in by_type.get('factionID', {}).items():
+        entities[('factionID', eid)] = start_date
 
     skipped_count = len(raw_entities) - len(entities)
     logger.info(f"Entities to pull: {len(entities)} (Optimized/Skipped {skipped_count} redundant entities)")
@@ -277,7 +414,10 @@ def _pull_zkillboard_data_logic(lock_id, past_seconds=None):
         system_ids = {km['solar_system_id'] for km in kms if km.get('solar_system_id')}
         missing_system_ids = system_ids - set(context['resolved_systems'].keys())
         if missing_system_ids:
-            new_systems = EveSolarSystem.objects.filter(id__in=missing_system_ids).select_related('eve_constellation__eve_region')
+            new_systems = EveSolarSystem.objects.filter(id__in=missing_system_ids)
+            select_related_fields = _system_select_related_fields()
+            if select_related_fields:
+                new_systems = new_systems.select_related(*select_related_fields)
             for s in new_systems:
                 context['resolved_systems'][s.id] = s
 
@@ -528,6 +668,128 @@ def repair_killmail_by_id(km_id, campaign_meta=None, context=None):
         logger.error(f"Error repairing killmail {km_id}: {e}")
     return False
 
+@shared_task(time_limit=7200)
+def cleanup_campaign_killmails(campaign_id=None):
+    """
+    Remove campaign killmails that no longer match current campaign rules.
+    Optionally limit cleanup to a single campaign by ID.
+    """
+    lock_id = "aacampaign-cleanup-campaign-killmails-lock"
+    # Acquire lock for 2 hours (7200s) as a hard limit.
+    if not cache.add(lock_id, True, 7200):
+        logger.warning("Cleanup task is already running. Skipping.")
+        return "Task already running"
+
+    try:
+        killmail_qs = CampaignKillmail.objects.all()
+        if campaign_id:
+            killmail_qs = killmail_qs.filter(campaign_id=campaign_id)
+
+        km_ids = list(killmail_qs.values_list('killmail_id', flat=True).distinct())
+        if not km_ids:
+            logger.info("No killmails found to clean up")
+            return "No killmails to clean up"
+
+        campaign_ids = list(killmail_qs.values_list('campaign_id', flat=True).distinct())
+        campaigns = list(Campaign.objects.filter(id__in=campaign_ids).prefetch_related(
+            'members', 'targets', 'systems', 'constellations', 'regions'
+        ))
+        campaign_meta = {}
+        for campaign in campaigns:
+            campaign_meta[campaign.id] = {
+                'friendly_ids': get_campaign_friendly_ids(campaign),
+                'target_ids': get_campaign_target_ids(campaign),
+                'system_ids': set(campaign.systems.values_list('id', flat=True)),
+                'constellation_ids': set(campaign.constellations.values_list('id', flat=True)),
+                'region_ids': set(campaign.regions.values_list('id', flat=True)),
+            }
+
+        context = {
+            'resolved_names': {},
+            'resolved_characters': {},
+            'resolved_systems': {},
+            'resolved_types': {},
+        }
+
+        removed_total = 0
+        kept_total = 0
+        skipped_total = 0
+        start_time = time.time()
+        total = len(km_ids)
+        allowed_campaign_ids = set(campaign_ids)
+
+        for i, km_id in enumerate(km_ids, 1):
+            # Hard stop if task exceeded 2 hours
+            if time.time() - start_time > 7200:
+                logger.warning("Cleanup task exceeded 2 hour limit, stopping early.")
+                break
+
+            removed, kept, skipped = cleanup_killmail_by_id(
+                km_id,
+                campaign_meta=campaign_meta,
+                context=context,
+                allowed_campaign_ids=allowed_campaign_ids
+            )
+            removed_total += removed
+            kept_total += kept
+            skipped_total += skipped
+            if i % 10 == 0:
+                logger.info(
+                    f"Processed {i}/{total} killmails "
+                    f"(Removed: {removed_total}, Kept: {kept_total}, Skipped: {skipped_total})"
+                )
+
+        logger.info(
+            f"Cleanup complete. Removed {removed_total} campaign killmails "
+            f"(Kept: {kept_total}, Skipped: {skipped_total})."
+        )
+        return f"Cleanup complete. Removed {removed_total} campaign killmails"
+    finally:
+        cache.delete(lock_id)
+
+def cleanup_killmail_by_id(km_id, campaign_meta=None, context=None, allowed_campaign_ids=None):
+    """
+    Re-evaluate a killmail against its campaigns and remove mismatches.
+    Returns (removed, kept, skipped).
+    """
+    url = f"https://zkillboard.com/api/killID/{km_id}/"
+    try:
+        response = _zkill_get(url)
+        data = response.json()
+        if isinstance(data, list) and len(data) > 0:
+            km_data = data[0]
+            campaigns = Campaign.objects.filter(killmails__killmail_id=km_id).distinct()
+            if allowed_campaign_ids:
+                campaigns = campaigns.filter(id__in=allowed_campaign_ids)
+
+            removed = 0
+            kept = 0
+            skipped = 0
+            for campaign in campaigns:
+                match = should_include_killmail(
+                    campaign,
+                    km_data,
+                    campaign_meta,
+                    context,
+                    allow_incomplete=True
+                )
+                if match is True:
+                    process_killmail(campaign, km_data, campaign_meta, context)
+                    kept += 1
+                elif match is False:
+                    CampaignKillmail.objects.filter(campaign=campaign, killmail_id=km_id).delete()
+                    removed += 1
+                    logger.info(f"Killmail {km_id} removed from campaign {campaign}: no longer matches")
+                else:
+                    skipped += 1
+                    logger.debug(f"Killmail {km_id} skipped for campaign {campaign}: incomplete data during cleanup")
+            return removed, kept, skipped
+        else:
+            logger.warning(f"Could not find killmail {km_id} on zKillboard for cleanup")
+    except Exception as e:
+        logger.error(f"Error cleaning killmail {km_id}: {e}")
+    return 0, 0, 0
+
 def fetch_from_zkill(entity_type, entity_id, past_seconds=None, page=None, year=None, month=None):
     if past_seconds:
         url = f"https://zkillboard.com/api/{entity_type}/{entity_id}/pastSeconds/{past_seconds}/"
@@ -575,10 +837,10 @@ def fetch_from_zkill(entity_type, entity_id, past_seconds=None, page=None, year=
 def fetch_killmail_from_esi(killmail_id, killmail_hash):
     try:
         logger.debug(f"Fetching killmail {killmail_id} from ESI")
-        data, _ = call_result(
-            lambda: esi.client.Killmails.GetKillmailsKillmailIdKillmailHash,
+        data = ESIHandler.get_killmail(
             killmail_id=killmail_id,
-            killmail_hash=killmail_hash
+            killmail_hash=killmail_hash,
+            force_refresh=True,
         )
         return data
     except Exception as e:
@@ -620,7 +882,8 @@ def get_killmail_time(km_data):
                     pass
     return None
 
-def should_include_killmail(campaign, km_data, campaign_meta=None, context=None):
+def should_include_killmail(campaign, km_data, campaign_meta=None, context=None, allow_incomplete=False):
+    _ensure_eve_models()
     # Basic validation
     km_id = km_data.get('killmail_id', 'Unknown')
 
@@ -685,12 +948,18 @@ def should_include_killmail(campaign, km_data, campaign_meta=None, context=None)
                     )
                     if not has_final_blow_char:
                         logger.warning(f"Killmail {km_id} missing final blow character after ESI fetch")
+                        if allow_incomplete:
+                            return None
                         return False
                 else:
                     logger.warning(f"Killmail {km_id} missing required fields and ESI fetch failed (ID: {km_id_val}, Hash: {km_hash})")
+                    if allow_incomplete:
+                        return None
                     return False
             else:
                 logger.warning(f"Killmail {km_id} missing required fields and no hash available for ESI fetch")
+                if allow_incomplete:
+                    return None
                 return False
 
     # Time check
@@ -700,6 +969,8 @@ def should_include_killmail(campaign, km_data, campaign_meta=None, context=None)
             km_time = timezone.make_aware(km_time)
     except (ValueError, TypeError) as e:
         logger.error(f"Killmail {km_id} has invalid time format: {km_data.get('killmail_time')} - {e}")
+        if allow_incomplete:
+            return None
         return False
 
     if km_time < campaign.start_date:
@@ -730,9 +1001,9 @@ def should_include_killmail(campaign, km_data, campaign_meta=None, context=None)
     has_targets = any(target_ids.values())
     target_involved = is_entity_involved(km_data, target_ids)
 
-    if target_involved:
-        logger.info(f"Killmail {km_id} matched for campaign {campaign}: target involved")
-        return True
+    if has_targets and not target_involved:
+        logger.debug(f"Killmail {km_id} skipped for campaign {campaign}: target required but not involved")
+        return False
 
     # Check if campaign is location restricted
     if campaign_meta and campaign.id in campaign_meta:
@@ -749,19 +1020,19 @@ def should_include_killmail(campaign, km_data, campaign_meta=None, context=None)
         )
 
     if not has_locations:
-        if not has_targets:
+        if has_targets:
+            logger.info(f"Killmail {km_id} matched for campaign {campaign}: target involved (no locations)")
+        else:
             # Global campaign with no specific targets -> match everything involving friendly
             logger.info(f"Killmail {km_id} matched for campaign {campaign}: global campaign (no targets/locations)")
-            return True
-        else:
-            # Global campaign with targets -> must match a target (already checked above)
-            logger.debug(f"Killmail {km_id} skipped for campaign {campaign}: global campaign, but no target match")
-            return False
+        return True
 
     # Location check
     system_id = km_data.get('solar_system_id')
     if not system_id:
         logger.warning(f"Killmail {km_id} missing solar_system_id even after ESI fetch/DB lookup")
+        if allow_incomplete:
+            return None
         return False
 
     location_match = False
@@ -780,28 +1051,36 @@ def should_include_killmail(campaign, km_data, campaign_meta=None, context=None)
         if system_id in campaign_meta[campaign.id]['system_ids']:
             location_match = True
         elif system:
-            if system.eve_constellation.eve_region_id in campaign_meta[campaign.id]['region_ids']:
+            system_region_id = _get_system_region_id(system)
+            system_constellation_id = _get_system_constellation_id(system)
+            if system_region_id in campaign_meta[campaign.id]['region_ids']:
                 location_match = True
-            elif system.eve_constellation_id in campaign_meta[campaign.id]['constellation_ids']:
+            elif system_constellation_id in campaign_meta[campaign.id]['constellation_ids']:
                 location_match = True
     else:
         if campaign.systems.filter(id=system_id).exists():
             location_match = True
         elif system:
-            if campaign.regions.filter(id=system.eve_constellation.eve_region_id).exists():
+            system_region_id = _get_system_region_id(system)
+            system_constellation_id = _get_system_constellation_id(system)
+            if system_region_id and campaign.regions.filter(id=system_region_id).exists():
                 location_match = True
-            elif campaign.constellations.filter(id=system.eve_constellation_id).exists():
+            elif system_constellation_id and campaign.constellations.filter(id=system_constellation_id).exists():
                 location_match = True
 
-    if location_match:
+    if not location_match:
+        logger.debug(f"Killmail {km_id} skipped for campaign {campaign}: location mismatch")
+        return False
+
+    if has_targets:
+        logger.info(f"Killmail {km_id} matched for campaign {campaign}: target and location match")
+    else:
         logger.info(f"Killmail {km_id} matched for campaign {campaign}: location match")
-        return True
-
-    return False
+    return True
 
 def get_campaign_friendly_ids(campaign):
     # Cache this maybe?
-    ids = {'characters': set(), 'corporations': set(), 'alliances': set()}
+    ids = {'characters': set(), 'corporations': set(), 'alliances': set(), 'factions': set()}
     for member in campaign.members.all():
         if member.character:
             ids['characters'].add(member.character.character_id)
@@ -809,10 +1088,12 @@ def get_campaign_friendly_ids(campaign):
             ids['corporations'].add(member.corporation.corporation_id)
         if member.alliance:
             ids['alliances'].add(member.alliance.alliance_id)
+        if member.faction:
+            ids['factions'].add(member.faction.faction_id)
     return ids
 
 def get_campaign_target_ids(campaign):
-    ids = {'characters': set(), 'corporations': set(), 'alliances': set()}
+    ids = {'characters': set(), 'corporations': set(), 'alliances': set(), 'factions': set()}
     for target in campaign.targets.all():
         if target.character:
             ids['characters'].add(target.character.character_id)
@@ -820,9 +1101,12 @@ def get_campaign_target_ids(campaign):
             ids['corporations'].add(target.corporation.corporation_id)
         if target.alliance:
             ids['alliances'].add(target.alliance.alliance_id)
+        if target.faction:
+            ids['factions'].add(target.faction.faction_id)
     return ids
 
 def is_entity_involved(km_data, entity_ids):
+    faction_ids = entity_ids.get('factions', set())
     # Check attackers
     for attacker in km_data.get('attackers', []):
         if attacker.get('character_id') in entity_ids['characters']:
@@ -830,6 +1114,8 @@ def is_entity_involved(km_data, entity_ids):
         if attacker.get('corporation_id') in entity_ids['corporations']:
             return True
         if attacker.get('alliance_id') in entity_ids['alliances']:
+            return True
+        if attacker.get('faction_id') in faction_ids:
             return True
 
     # Check victim
@@ -840,10 +1126,13 @@ def is_entity_involved(km_data, entity_ids):
         return True
     if victim.get('alliance_id') in entity_ids['alliances']:
         return True
+    if victim.get('faction_id') in faction_ids:
+        return True
 
     return False
 
 def process_killmail(campaign, km_data, campaign_meta=None, context=None):
+    _ensure_eve_models()
     km_id = km_data['killmail_id']
     try:
         km_time = timezone.datetime.fromisoformat(km_data['killmail_time'].replace('Z', '+00:00'))
@@ -881,7 +1170,8 @@ def process_killmail(campaign, km_data, campaign_meta=None, context=None):
     is_loss = False
     if (victim.get('character_id') in friendly_ids['characters'] or
         victim.get('corporation_id') in friendly_ids['corporations'] or
-        victim.get('alliance_id') in friendly_ids['alliances']):
+        victim.get('alliance_id') in friendly_ids['alliances'] or
+        victim.get('faction_id') in friendly_ids['factions']):
         is_loss = True
 
     # Resolve names
@@ -897,17 +1187,12 @@ def process_killmail(campaign, km_data, campaign_meta=None, context=None):
         try:
             # Also get ship group name for stats
             s_type = None
-            if context and ship_type_id in context.get('resolved_types', {}):
-                s_type = context['resolved_types'][ship_type_id]
-            else:
-                s_type, _ = EveType.objects.get_or_create_esi(id=ship_type_id)
-                if context: context.setdefault('resolved_types', {})[ship_type_id] = s_type
+            s_type = _get_item_type(ship_type_id, context)
 
             if s_type:
                 if ship_type_name in ("", "Unknown"):
                     ship_type_name = getattr(s_type, "name", ship_type_name)
-                if s_type.eve_group:
-                    ship_group_name = s_type.eve_group.name
+                ship_group_name = _get_type_group_name(s_type)
         except Exception as e:
             logger.warning(f"Failed to get ship group for {ship_type_id}: {e}")
 
@@ -1001,7 +1286,8 @@ def process_killmail(campaign, km_data, campaign_meta=None, context=None):
             is_friendly = (
                 (char_id and char_id in friendly_ids['characters']) or
                 (corp_id and corp_id in friendly_ids['corporations']) or
-                (alliance_id and alliance_id in friendly_ids['alliances'])
+                (alliance_id and alliance_id in friendly_ids['alliances']) or
+                (attacker.get('faction_id') in friendly_ids['factions'])
             )
 
             if is_friendly and char_id:

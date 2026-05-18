@@ -8,6 +8,7 @@ from django.shortcuts import render, get_object_or_404
 from django.db.models import Sum, Count, Q
 from django.http import JsonResponse
 from .models import Campaign, CampaignKillmail
+from .eve_sde import get_solar_system_select_related_fields
 
 @login_required
 @permission_required("aacampaign.basic_access")
@@ -61,7 +62,7 @@ def campaign_details(request: WSGIRequest, campaign_id: int) -> HttpResponse:
 
     # Recent killmails for the new tab
     recent_killmails = campaign.killmails.select_related(
-        'solar_system', 'solar_system__eve_constellation__eve_region'
+        *get_solar_system_select_related_fields()
     ).prefetch_related('attackers').order_by('-killmail_time')[:1000]
 
     context = {

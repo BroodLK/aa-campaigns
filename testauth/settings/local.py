@@ -12,6 +12,9 @@ from .base import *
 
 PACKAGE = "aacampaign"
 
+# Modeltranslation must be first in INSTALLED_APPS.
+INSTALLED_APPS = ["modeltranslation"] + INSTALLED_APPS
+
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/1.10/howto/static-files/
 # STATICFILES_DIRS = [os.path.join(PROJECT_DIR, f"{PACKAGE}/static")]
@@ -62,8 +65,8 @@ NOTIFICATIONS_MAX_PER_USER = 50
 
 # Add any additional apps to this list.
 INSTALLED_APPS += [
-    'eveuniverse',
-    'bitfield',
+    "eve_sde",
+    "bitfield",
     PACKAGE,
 ]
 
@@ -95,6 +98,16 @@ ESI_SSO_CLIENT_ID = "dummy"
 ESI_SSO_CLIENT_SECRET = "dummy"
 ESI_SSO_CALLBACK_URL = "http://localhost:8000"
 ESI_USER_CONTACT_EMAIL = "dummy@example.net"
+
+# ------------------------------------------------------------------------------------ #
+#
+#                                SDE Settings
+#
+# ------------------------------------------------------------------------------------ #
+CELERYBEAT_SCHEDULE["check_for_sde_updates"] = {
+    "task": "eve_sde.tasks.check_for_sde_updates",
+    "schedule": crontab(minute="0", hour="12"),
+}
 
 
 # ------------------------------------------------------------------------------------ #

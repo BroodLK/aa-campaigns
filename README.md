@@ -7,7 +7,7 @@
 
 
 > [!IMPORTANT]
-> AA Campaign requires a working installation of **Alliance Auth** and **django-eveuniverse**. Ensure these are set up before proceeding with the installation.
+> AA Campaign requires a working installation of **Alliance Auth** plus **django-eveonline-sde**.
 
 # AA Campaign
 AA Campaign is a plugin for **Alliance Auth** that allows you to create and track ZKill campaigns. Whether you're monitoring a specific system, a whole region, or targeting a rival alliance, AA Campaign pulls data directly from ZKillboard to provide real-time intelligence and performance tracking.
@@ -33,7 +33,7 @@ AA Campaign is a plugin for **Alliance Auth** that allows you to create and trac
 
 ```md
 allianceauth >= 4.12
-django-eveuniverse
+django-eveonline-sde
 ```
 
 ## Install Instructions
@@ -42,16 +42,33 @@ After making sure to add the above prerequisite applications.
 source /home/allianceserver/venv/auth/bin/activate && cd /home/allianceserver/myauth/
 ```
 ```bash
-pip install aa-campaign==1.0.3
+pip install django-eveonline-sde
+pip install aa-campaign
 ```
 ```bash
 vi myauth/settings/local.py
 ```
-Add `aacampaign` to your `INSTALLED_APPS`. Ensure that `eveuniverse` is also present in `INSTALLED_APPS`.
+
+Add `aacampaign` to your `INSTALLED_APPS`.
+
 ```bash
 python manage.py migrate && python manage.py collectstatic --noinput
+python manage.py esde_load_sde
 python manage.py aa_campaign_setup
 ```
+
+## Upgrade Notes
+
+For an existing installation that is still using `django-eveuniverse`:
+
+```bash
+pip install -U django-eveonline-sde aa-campaign
+python manage.py migrate eve_sde
+python manage.py esde_load_sde
+python manage.py migrate
+```
+
+If you already have campaign location or killmail data, load the SDE before running the AA Campaign migration so the new foreign keys can be created successfully. After the upgrade is complete, `django-eveuniverse` can be removed from your environment and `INSTALLED_APPS`.
 restart the things
 exit your venv
 ```bash

@@ -26,5 +26,22 @@ class Command(BaseCommand):
             }
         )
 
+        cleanup_schedule, _ = CrontabSchedule.objects.get_or_create(
+            minute='30',
+            hour='3',
+            day_of_week='*',
+            day_of_month='*',
+            month_of_year='*',
+        )
+
+        PeriodicTask.objects.update_or_create(
+            name='AA Campaign: Cleanup Campaign Killmails',
+            defaults={
+                'task': 'aacampaign.tasks.cleanup_campaign_killmails',
+                'crontab': cleanup_schedule,
+                'enabled': True,
+            }
+        )
+
         self.stdout.write(self.style.SUCCESS('Successfully setup periodic tasks for AA Campaign.'))
         self.stdout.write("Please ensure your Celery worker and beat services are running.")

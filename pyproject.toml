@@ -37,8 +37,8 @@ dynamic = [
     "version",
 ]
 dependencies = [
-    "allianceauth>=4.3.1,<5",
-    "django-eveuniverse",
+    "allianceauth>=4.3.1",
+    "django-eveonline-sde",
 ]
 urls.Changelog = "https://github.com/BroodLK/aa-campaign/blob/master/CHANGELOG.md"
 urls.Tracker = "https://github.com/BroodLK/aa-campaign/issues"

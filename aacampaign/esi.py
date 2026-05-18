@@ -4,14 +4,21 @@ from __future__ import annotations
 import logging
 import time
 from hashlib import md5
+from typing import Any
 from django.conf import settings
 from django.core.cache import cache
 from django.utils import timezone
 from email.utils import parsedate_to_datetime
+from aiopenapi3 import ContentTypeError
+from httpx import Response
 from esi import app_settings
-from esi.openapi_clients import ESIClientProvider
-from bravado.exception import HTTPNotModified
-from esi.exceptions import ESIBucketLimitException, ESIErrorLimitException
+from esi.openapi_clients import ESIClientProvider, EsiOperation
+from esi.exceptions import (
+    ESIBucketLimitException,
+    ESIErrorLimitException,
+    HTTPClientError,
+    HTTPNotModified,
+)
 from esi.rate_limiting import interval_to_seconds
 
 from . import __title__, __version__, __github_url__, __esi_compatibility_date__
@@ -73,62 +80,213 @@ def parse_expires(headers: dict | None):
     return dt.astimezone(timezone.utc)
 
 
-def call_result(operation, **kwargs):
+def call_result(
+    operation,
+    use_etag: bool = True,
+    force_refresh: bool = False,
+    use_cache: bool = True,
+    **kwargs,
+):
     """Execute an OpenAPI operation.result() call and return (data, expires_at)."""
-    rate_limit_threshold = getattr(settings, "ESI_RATE_LIMIT_SOFT_THRESHOLD", 100)
-    max_backoff_retries = getattr(settings, "ESI_RATE_LIMIT_MAX_RETRIES", 3)
-    spec_backoff_seconds = getattr(settings, "ESI_SPEC_BACKOFF_SECONDS", 60)
-    attempts = 0
-    spec_refreshed = False
-    try:
-        # Bind params via __call__ so requestBody is handled correctly by django-esi.
-        op = _bind_operation(_resolve_operation(operation, spec_backoff_seconds), **kwargs)
-        while True:
-            try:
-                # force_refresh=True bypasses the ETag 304 check and returns fresh data
-                data, response = op.result(return_response=True, force_refresh=True)
-                _log_rate_limit_remaining(response.headers)
-                _maybe_backoff_on_rate_limit(response.headers, rate_limit_threshold)
-                return to_plain(data), parse_expires(response.headers)
-            except (ESIBucketLimitException, ESIErrorLimitException) as e:
-                attempts += 1
-                wait_seconds = int(getattr(e, "reset", 0) or 0)
-                if wait_seconds <= 0:
-                    wait_seconds = 60
-                logger.warning("ESI rate limit hit (%s). Backing off for %ss.", e, wait_seconds)
-                time.sleep(wait_seconds)
-                if attempts >= max_backoff_retries:
-                    raise
-            except Exception as e:
-                if _should_refresh_spec(e, spec_refreshed):
-                    spec_refreshed = True
-                    _refresh_esi_client()
-                    time.sleep(spec_backoff_seconds)
-                    op = _bind_operation(_rebind_operation(operation, spec_backoff_seconds), **kwargs)
-                    continue
-                raise
-    except Exception as e:
-        logger.error("Error calling ESI operation: %s", e)
-        raise
+    op = _prepare_operation(operation, **kwargs)
+    data, response = _execute_operation(
+        operation,
+        op,
+        kwargs,
+        list_result=False,
+        use_etag=use_etag,
+        force_refresh=force_refresh,
+        use_cache=use_cache,
+    )
+    expires_at = parse_expires(response.headers) if response else None
+    return data, expires_at
 
 
-def call_results(operation, **kwargs):
+def call_results(
+    operation,
+    use_etag: bool = True,
+    force_refresh: bool = False,
+    use_cache: bool = True,
+    **kwargs,
+):
     """Execute operation.results() and return (list_data, expires_at) with plain types."""
+    op = _prepare_operation(operation, **kwargs)
+    data, response = _execute_operation(
+        operation,
+        op,
+        kwargs,
+        list_result=True,
+        use_etag=use_etag,
+        force_refresh=force_refresh,
+        use_cache=use_cache,
+    )
+    expires_at = parse_expires(response.headers) if response else None
+    return data, expires_at
+
+
+class ESIHandler:
+    """Handler for ESI operations with OpenAPI client semantics."""
+
+    @classmethod
+    def result(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+        cls,
+        operation: EsiOperation,
+        use_etag: bool = True,
+        return_response: bool = False,
+        force_refresh: bool = False,
+        use_cache: bool = True,
+        **extra,
+    ) -> tuple[Any, Response] | Any:
+        """Retrieve the result of an ESI operation, handling common exceptions."""
+        op = _prepare_operation(operation, **extra)
+        data, response = _execute_operation(
+            operation,
+            op,
+            extra,
+            list_result=False,
+            use_etag=use_etag,
+            force_refresh=force_refresh,
+            use_cache=use_cache,
+        )
+        return (data, response) if return_response else data
+
+    @classmethod
+    def results(
+        cls,
+        operation: EsiOperation,
+        use_etag: bool = True,
+        return_response: bool = False,
+        force_refresh: bool = False,
+        use_cache: bool = True,
+        **extra,
+    ) -> tuple[Any, Response] | Any:
+        """Retrieve list results of an ESI operation."""
+        op = _prepare_operation(operation, **extra)
+        data, response = _execute_operation(
+            operation,
+            op,
+            extra,
+            list_result=True,
+            use_etag=use_etag,
+            force_refresh=force_refresh,
+            use_cache=use_cache,
+        )
+        return (data, response) if return_response else data
+
+    @classmethod
+    def post_universe_names(cls, ids: list[int], use_etag: bool = False) -> list[dict] | None:
+        logger.debug("Getting universe names for %s IDs", len(ids))
+        return cls.result(
+            operation=esi.client.Universe.PostUniverseNames(body=ids),
+            use_etag=use_etag,
+        )
+
+    @classmethod
+    def post_universe_ids(cls, names: list[str], use_etag: bool = True) -> list[dict] | None:
+        logger.debug("Getting universe IDs for %s names", len(names))
+        return cls.result(
+            operation=esi.client.Universe.PostUniverseIds(body=names),
+            use_etag=use_etag,
+        )
+
+    @classmethod
+    def get_corporations_corporation_id(
+        cls, corporation_id: int, use_etag: bool = True
+    ) -> dict[str, Any] | None:
+        logger.debug("Getting corporation information for corporation ID: %s", corporation_id)
+        return cls.result(
+            operation=esi.client.Corporation.GetCorporationsCorporationId(
+                corporation_id=corporation_id
+            ),
+            use_etag=use_etag,
+        )
+
+    @classmethod
+    def get_alliances_alliance_id(
+        cls, alliance_id: int, use_etag: bool = True
+    ) -> dict[str, Any] | None:
+        logger.debug("Getting alliance information for alliance ID: %s", alliance_id)
+        return cls.result(
+            operation=esi.client.Alliance.GetAlliancesAllianceId(
+                alliance_id=alliance_id
+            ),
+            use_etag=use_etag,
+        )
+
+    @classmethod
+    def get_killmail(
+        cls, killmail_id: int, killmail_hash: str, use_etag: bool = True, force_refresh: bool = False
+    ) -> dict[str, Any] | None:
+        logger.debug("Getting killmail %s from ESI", killmail_id)
+        return cls.result(
+            operation=esi.client.Killmails.GetKillmailsKillmailIdKillmailHash(
+                killmail_id=killmail_id, killmail_hash=killmail_hash
+            ),
+            use_etag=use_etag,
+            force_refresh=force_refresh,
+        )
+
+
+def _prepare_operation(operation, **kwargs):
+    spec_backoff_seconds = getattr(settings, "ESI_SPEC_BACKOFF_SECONDS", 60)
+    op = _resolve_operation(operation, spec_backoff_seconds)
+    return _bind_operation(op, **kwargs)
+
+
+def _execute_operation(
+    operation,
+    op,
+    kwargs,
+    *,
+    list_result: bool,
+    use_etag: bool,
+    force_refresh: bool,
+    use_cache: bool,
+):
     rate_limit_threshold = getattr(settings, "ESI_RATE_LIMIT_SOFT_THRESHOLD", 100)
     max_backoff_retries = getattr(settings, "ESI_RATE_LIMIT_MAX_RETRIES", 3)
     spec_backoff_seconds = getattr(settings, "ESI_SPEC_BACKOFF_SECONDS", 60)
     attempts = 0
     spec_refreshed = False
     try:
-        # Bind params via __call__ so requestBody is handled correctly by django-esi.
-        op = _bind_operation(_resolve_operation(operation, spec_backoff_seconds), **kwargs)
         while True:
             try:
-                # force_refresh=True bypasses the ETag 304 check and returns fresh data
-                data, response = op.results(return_response=True, force_refresh=True)
+                if list_result:
+                    data, response = op.results(
+                        return_response=True,
+                        use_etag=use_etag,
+                        force_refresh=force_refresh,
+                        use_cache=use_cache,
+                    )
+                else:
+                    data, response = op.result(
+                        return_response=True,
+                        use_etag=use_etag,
+                        force_refresh=force_refresh,
+                        use_cache=use_cache,
+                    )
                 _log_rate_limit_remaining(response.headers)
                 _maybe_backoff_on_rate_limit(response.headers, rate_limit_threshold)
-                return to_plain(data), parse_expires(response.headers)
+                return to_plain(data), response
+            except HTTPNotModified:
+                logger.debug(
+                    "ESI returned 304 Not Modified for %s",
+                    getattr(op, "operation", None).operationId
+                    if getattr(op, "operation", None)
+                    else op,
+                )
+                return None, None
+            except ContentTypeError:
+                logger.warning(
+                    "ESI returned gibberish (ContentTypeError) for %s",
+                    getattr(op, "operation", None).operationId
+                    if getattr(op, "operation", None)
+                    else op,
+                )
+                return None, None
+            except HTTPClientError as exc:
+                logger.error("ESI HTTP error for %s: %s", op, exc)
+                return None, None
             except (ESIBucketLimitException, ESIErrorLimitException) as e:
                 attempts += 1
                 wait_seconds = int(getattr(e, "reset", 0) or 0)
@@ -143,12 +301,14 @@ def call_results(operation, **kwargs):
                     spec_refreshed = True
                     _refresh_esi_client()
                     time.sleep(spec_backoff_seconds)
-                    op = _bind_operation(_rebind_operation(operation, spec_backoff_seconds), **kwargs)
+                    op = _bind_operation(
+                        _rebind_operation(operation, spec_backoff_seconds), **kwargs
+                    )
                     continue
                 raise
     except Exception as e:
         logger.error("Error calling ESI operation: %s", e)
-        raise
+        return None, None
 
 
 def _bind_operation(operation, **kwargs):
